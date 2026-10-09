@@ -98,6 +98,8 @@ Best case — no backup stream switch, no rebuffer gap. The main stream plays un
 | `Video state: readyState=2 networkState=2 ... paused=true` | Player stalled with insufficient data. May self-recover |
 | `Twitch paused the player during an ad break with no user interaction — ad-owned pause, not user intent; leaving it until the break ends, then resuming` | Twitch's own ad-transition pause (no click/key within 1.2s). Not fought mid-break (that replayed content); resumed at break end by the ad-end edge and the post-break watchdog. The `right after an ad break … the post-break watchdog will resume it` variant is the same pause inside the 15s post-break window |
 | `Player still paused after the ad break and the pause did not come from the user — resuming` | Break-end / watchdog resume of an ad-owned pause. If the watchdog gives up after 3 attempts, look for a `play() rejected after …` line (browser refused the call) |
+| `Playlist splice #N native → backup:<type>: skipped K already-served segment(s) (new source picks up ±Xms from the served edge), DISCONTINUITY before seq S, disc-seq offset O (window …)` | Testing v682+: the playlist handed to the player switched source (native → backup, backup rotation, or backup → native). K segments the player was already offered were dropped, an `#EXT-X-DISCONTINUITY` marks the splice and discontinuity numbering stays continuous — the signal the player needs to append a different encoder's segments without draining its buffer. ±Xms is how far the first retained segment starts from the served edge (negative = that much replay, positive = that much skipped); a few hundred ms either way is normal. `served untrimmed (expect a short replay)` means the backup window was entirely behind the served edge; `no usable PROGRAM-DATE-TIME` means the overlap could not be measured (discontinuity only). Opt-out: `twitchAdSolutions_disableSpliceDiscontinuity=true` |
+| `Playlist splice alignment failed — serving the unaligned playlist: …` | The v682 splice rewrite threw; the raw playlist was served instead (pre-v682 behaviour for that poll). Please report the line |
 | `Respecting user pause intent — skipping auto-resume` | The pause followed an explicit play/pause interaction; vaft leaves it alone |
 | `Position jumped Xs — starting drift correction` | Player jumped ahead. Drift correction speeds up to catch live edge |
 | `Downgraded reload to pause/play to preserve PiP` | PiP mode active. Using lighter recovery to keep PiP open |
@@ -138,6 +140,9 @@ localStorage.setItem('twitchAdSolutions_driftCorrectionRate', '0');
 
 // Disable reload cap (allow unlimited reloads)
 localStorage.setItem('twitchAdSolutions_disableReloadCap', 'true');
+
+// Testing v682+: serve backup playlists raw again, with no DISCONTINUITY at the source switch (A/B isolation)
+localStorage.setItem('twitchAdSolutions_disableSpliceDiscontinuity', 'true');
 
 // Hide the "Blocking ads" banner
 localStorage.setItem('twitchAdSolutions_hideAdOverlay', 'true');

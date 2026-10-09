@@ -37,7 +37,7 @@ twitch-videoad.js text/javascript
         }
     }
     'use strict';
-    const ourTwitchAdSolutionsVersion = 681;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 682;// Used to prevent conflicts with outdated versions of the scripts
     console.log('[AD DEBUG] TwitchAdSolutions vaft-testing v' + ourTwitchAdSolutionsVersion + ' loading');
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log('[AD DEBUG] CONFLICT: vaft-testing v' + ourTwitchAdSolutionsVersion + ' skipped — another script already active (v' + window.twitchAdSolutionsVersion + '). Remove duplicate scripts.');
@@ -85,6 +85,7 @@ twitch-videoad.js text/javascript
         scope.DisableInAdFreezeReload = false;// In-ad frozen-playhead reload escalation — readyState-independent backstop for audio-gap CSAI freezes the gap-seek can't catch (observed ~60s stalls). Default on. Set twitchAdSolutions_disableInAdFreezeReload=true to turn it OFF.
         scope.DisablePostBreakWedge = false;// Post-break video-wedge recovery (mirrors GosuDRM/TTV-AB _checkPostBreakWedge, v12.0.0). Detects "audio running, video frozen" after an ad break — playhead advancing while the decoder emits no new frames — via getVideoPlaybackQuality().totalVideoFrames, which the currentTime-based freeze checks can't see. Default on. Set twitchAdSolutions_disablePostBreakWedge=true to turn it OFF.
         scope.DisableAdOwnedResume = false;// v681 / v68.5.8: a no-interaction pause during a break or the 15s post-break window is Twitch's own ad-transition pause, resumed at break end (watchdog-backed) instead of being read as user intent. Default on. Set twitchAdSolutions_disableAdOwnedResume=true to turn it OFF (every pause is user intent again — the pre-v680 behaviour).
+        scope.DisableSpliceDiscontinuity = false;// v682: every playlist source switch (native → backup, backup rotation, backup → native) trims the segments the player was already offered and marks the splice with #EXT-X-DISCONTINUITY + continuous DISCONTINUITY-SEQUENCE numbering — the HLS signal that the new source's timestamps do not continue the old ones (GosuDRM/TTV-AB 9.3.2 / 16.0.7 / 19.x). Default on. Set twitchAdSolutions_disableSpliceDiscontinuity=true to turn it OFF (raw backup playlists — the pre-v682 splice).
         scope.DisableBackgroundResume = false;// Issue #255: resume a Twitch-initiated pause while the tab is hidden (retry chain, strike-capped so a deliberate media-key pause is respected). Default on. Set twitchAdSolutions_disableBackgroundResume=true to turn it OFF.
         scope.AvSyncTrace = true;// A/V desync diagnostics (testing): [AV TRACE] logs playlist splices, BLANK_MP4 substitutions and per-track SourceBuffer ranges / timestampOffset changes during ad breaks + 30s after. Set twitchAdSolutions_avSyncTrace=false to silence. Call avSyncMark() in the console when you notice desync.
         scope.AvTraceBlankServed = 0;
@@ -187,6 +188,16 @@ twitch-videoad.js text/javascript
             TraceReturnKind: 'native',// source of the playlist returned this poll: native / backup:<type> / recovery-*
             TraceState: Object.create(null),// per media-playlist url: last returned source, seq window, seq→url/PDT
             TraceUntil: 0,// keep tracing this long after the break ends (post-break reload window)
+            // Playlist splice continuity (v682) — see alignPlaylistSplice. Reset on TriggeredPlayerReload.
+            SpliceIdentity: null,// source of the last playlist served: 'native' | 'backup:<type>|<media playlist url>'
+            SpliceLastEndTime: 0,// wall-clock (PROGRAM-DATE-TIME ms) end of the newest segment the player was offered
+            SplicePrefetchUrls: [],// PREFETCH urls offered by the last served playlist — their timing is confirmed when a later playlist lists them
+            SpliceBoundarySeq: null,// MEDIA-SEQUENCE of the current source's first segment; the DISCONTINUITY sits in front of it while it is in the window
+            SpliceDiscOffset: 0,// added to the source's own DISCONTINUITY-SEQUENCE so numbering continues across sources
+            SpliceLastDisc: null,// highest discontinuity number offered so far (across sources)
+            SpliceNativeBoundaries: null,// native variant url → boundary seq (each variant meets the splice at its own first poll)
+            SpliceCount: 0,// splices this player session (log numbering)
+            ServedBackupUrl: null,// media playlist url of the committed backup — part of the backup identity (a re-fetched session is a new source)
             FastAutoplayConsecutive: 0,// Re-probe counter — periodic full Source-tier probe to catch channel recovery.
             // Reload cooldown
             LastPlayerReload: 0,
@@ -344,6 +355,7 @@ twitch-videoad.js text/javascript
                     ${replaceServerTimeInM3u8.toString()}
                     ${createStreamInfo.toString()}
                     ${traceM3u8Splice.toString()}
+                    ${alignPlaylistSplice.toString()}
                     ${hookAvSyncTrace.toString()}
                     const workerString = getWasmWorkerJs('${twitchBlobUrl.replaceAll("'", "%27")}');
                     declareOptions(self);
@@ -358,6 +370,7 @@ twitch-videoad.js text/javascript
                     DisableAdSpoofing = ${DisableAdSpoofing};
                     SoftReloadNoStrip = ${SoftReloadNoStrip};
                     AvSyncTrace = ${AvSyncTrace};
+                    DisableSpliceDiscontinuity = ${DisableSpliceDiscontinuity};
                     ForceAccessTokenPlayerType = '${ForceAccessTokenPlayerType}';
                     GQLDeviceID = ${GQLDeviceID ? "'" + GQLDeviceID + "'" : null};
                     AuthorizationHeader = ${AuthorizationHeader ? "'" + AuthorizationHeader + "'" : undefined};
@@ -410,6 +423,20 @@ twitch-videoad.js text/javascript
                             }
                         } else if (e.data.key == 'TriggeredPlayerReload') {
                             HasTriggeredPlayerReload = true;
+                            // A reload tears the player's buffer down: the served timeline and the discontinuity
+                            // numbering restart with whatever playlist the rebuilt player fetches first (v682).
+                            for (const name in StreamInfos) {
+                                const si = StreamInfos[name];
+                                if (si) {
+                                    si.SpliceIdentity = null;
+                                    si.SpliceLastEndTime = 0;
+                                    si.SplicePrefetchUrls = [];
+                                    si.SpliceBoundarySeq = null;
+                                    si.SpliceDiscOffset = 0;
+                                    si.SpliceLastDisc = null;
+                                    si.SpliceNativeBoundaries = null;
+                                }
+                            }
                         } else if (e.data.key == 'ReloadSkipped') {
                             // Main thread refused the reload (player healthy) — clear the
                             // early-reload flags so we can re-fire if the player later stalls
@@ -667,6 +694,280 @@ twitch-videoad.js text/javascript
         }
         st.bySeq = bySeq;
     }
+    // Playlist splice continuity (v682 — port of GosuDRM/TTV-AB 9.3.2 "splice discontinuity",
+    // 16.0.7 continuous discontinuity numbering and the 19.x _alignLivePlaylist overlap trim).
+    // A backup playlist comes from a different Twitch encoder session: its own MEDIA-SEQUENCE
+    // numbering, its own PROGRAM-DATE-TIME window and — decisively — its own internal media
+    // timestamps, which do not continue the stream the player was appending. Served raw, nothing
+    // tells the player the timeline jumps at the swap, so it cannot place the incoming segments
+    // against what it has buffered: it drains ("Playhead stalling at X, buffer end X"), pauses while
+    // it rebuilds, and an overlapping window replays content it already played. On every source
+    // switch (native → backup, backup → backup rotation, backup → native) this:
+    //   1. drops the leading segments whose wall-clock span the player was already offered — the
+    //      PREFETCH segments included, once a later playlist of the same source confirms their
+    //      timing — so the new source picks up at the served edge (50ms tolerance, midpoint rule);
+    //   2. rewrites MEDIA-SEQUENCE for the dropped count (the source keeps its own numbering);
+    //   3. inserts #EXT-X-DISCONTINUITY in front of the first retained segment, and keeps it there
+    //      on every later poll while that segment is still in the window;
+    //   4. carries an EXT-X-DISCONTINUITY-SEQUENCE offset so discontinuity numbering stays
+    //      continuous across sources (what Firefox aligns audio and video on).
+    // Runs on the final playlist handed to the player, after processM3U8, so every return path is
+    // covered (native, backup:<type>, native snapshot, recovery replay). State lives on streamInfo
+    // (Splice*) and is reset when the player reloads (TriggeredPlayerReload): a rebuilt buffer
+    // restarts the served timeline with whatever playlist it fetches first.
+    // Serialized into the worker blob — no outer-scope references.
+    function alignPlaylistSplice(url, inputText, outputText, streamInfo) {
+        if (!streamInfo || typeof outputText !== 'string' || outputText.includes('#EXT-X-STREAM-INF')) return outputText;
+        const HANDOFF_TOLERANCE_MS = 50;
+        const SEGMENT_TAG_RE = /^#EXT(?:INF:|-X-(?:PROGRAM-DATE-TIME:|BYTERANGE:|GAP(?:$|:)|DISCONTINUITY(?:$|:)|PART:|PRELOAD-HINT:|TWITCH-PREFETCH(?:-DISCONTINUITY)?[:]?))/;
+        const parseFirstSeq = (text) => {
+            const m = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+            const n = m ? parseInt(m[1], 10) : NaN;
+            return isNaN(n) ? null : n;
+        };
+        const parseDiscSeq = (text) => {
+            const m = text.match(/#EXT-X-DISCONTINUITY-SEQUENCE:(\d+)/);
+            const n = m ? parseInt(m[1], 10) : NaN;
+            return isNaN(n) ? 0 : n;
+        };
+        const setDiscSeq = (lines, value) => {
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) {
+                    lines[i] = '#EXT-X-DISCONTINUITY-SEQUENCE:' + value;
+                    return;
+                }
+            }
+            let at = 0;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith('#EXT-X-MEDIA-SEQUENCE:')) { at = i + 1; break; }
+                if (lines[i].startsWith('#EXTM3U')) at = i + 1;
+            }
+            lines.splice(at, 0, '#EXT-X-DISCONTINUITY-SEQUENCE:' + value);
+        };
+        const isMediaLine = (line) => line.startsWith('#EXTINF:') || line.startsWith('#EXT-X-TWITCH-PREFETCH:') || line.startsWith('#EXT-X-PART:');
+        // Discontinuity number of the first and last media line (segments and prefetch hints).
+        const discRange = (text) => {
+            let current = parseDiscSeq(text);
+            let first = null;
+            let last = null;
+            for (const raw of text.split(/\r?\n/)) {
+                const line = raw.trim();
+                if (line === '#EXT-X-DISCONTINUITY') {
+                    current++;
+                } else if (isMediaLine(line)) {
+                    if (first === null) first = current;
+                    last = current;
+                }
+            }
+            return { first, last };
+        };
+        // Segment timeline: wall-clock start/end per EXTINF (explicit PROGRAM-DATE-TIME, or derived
+        // from the next dated segment), the line span of its block, the discontinuity number it
+        // sits in, and the PREFETCH urls offered after the last segment.
+        const parseTimeline = (text) => {
+            const lines = text.split(/\r?\n/);
+            const segs = [];
+            let nextTime = NaN;
+            let explicit = false;
+            let blockStart = 0;
+            let disc = parseDiscSeq(text);
+            let lastUriIndex = -1;
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (line === '#EXT-X-DISCONTINUITY') {
+                    disc++;
+                    if (!explicit) nextTime = NaN;
+                }
+                if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+                    nextTime = Date.parse(line.substring(25));
+                    explicit = true;
+                }
+                if (!line.startsWith('#EXTINF:')) continue;
+                const dur = parseFloat(line.substring(8)) * 1000;
+                let uriIndex = -1;
+                for (let j = i + 1; j < lines.length; j++) {
+                    const t = lines[j].trim();
+                    if (!t) continue;
+                    if (t.startsWith('#')) {
+                        if (t === '#EXT-X-DISCONTINUITY') {
+                            disc++;
+                            if (!explicit) nextTime = NaN;
+                        } else if (t.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+                            nextTime = Date.parse(t.substring(25));
+                            explicit = true;
+                        }
+                        continue;
+                    }
+                    uriIndex = j;
+                    break;
+                }
+                if (uriIndex < 0 || !(dur > 0)) return null;
+                segs.push({ start: blockStart, uriIndex, url: lines[uriIndex].trim(), time: nextTime, end: nextTime + dur, dur, disc });
+                nextTime += dur;
+                explicit = false;
+                blockStart = uriIndex + 1;
+                lastUriIndex = uriIndex;
+                i = uriIndex;
+            }
+            for (let i = segs.length - 2; i >= 0; i--) {
+                const s = segs[i];
+                const n = segs[i + 1];
+                if (!isFinite(s.time) && isFinite(n.time) && s.disc === n.disc) {
+                    s.end = n.time;
+                    s.time = n.time - s.dur;
+                }
+            }
+            const prefetch = [];
+            for (let i = lastUriIndex + 1; i < lines.length; i++) {
+                if (lines[i].startsWith('#EXT-X-TWITCH-PREFETCH:')) prefetch.push(lines[i].substring(23).trim());
+            }
+            const timed = segs.length > 0 && segs.every((s, i) => isFinite(s.time) && (i === 0 || s.time >= segs[i - 1].time));
+            return { lines, segs, prefetch, timed, firstSeq: parseFirstSeq(text) };
+        };
+        // Insert the boundary DISCONTINUITY in front of segment `boundarySeq` (if it is still in the
+        // window) and apply the numbering offset; once the boundary has scrolled out, the offset
+        // absorbs it (+1) so the count the player saw never goes backwards.
+        const insertBoundary = (text, boundarySeq, firstSeq, offset) => {
+            if (boundarySeq === null || firstSeq === null) return text;
+            const pos = boundarySeq - firstSeq;
+            const lines = text.split(/\r?\n/);
+            const base = parseDiscSeq(text);
+            if (offset !== 0) setDiscSeq(lines, Math.max(0, base + offset));
+            if (pos < 0) {
+                setDiscSeq(lines, Math.max(0, base + offset + 1));
+                return lines.join('\n');
+            }
+            let seen = 0;
+            let insertAt = -1;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith('#EXTINF:')) {
+                    if (seen === pos) { insertAt = i; break; }
+                    seen++;
+                }
+            }
+            if (insertAt < 0) return lines.join('\n');
+            if (insertAt > 0 && lines[insertAt - 1].trim() === '#EXT-X-DISCONTINUITY') return lines.join('\n');
+            lines.splice(insertAt, 0, '#EXT-X-DISCONTINUITY');
+            return lines.join('\n');
+        };
+        // A segment the previous playlist of this source listed as a PREFETCH hint now carries its
+        // timing: the player may have buffered it, so the served edge extends to its end.
+        const confirmPrefetch = (tl) => {
+            const pending = streamInfo.SplicePrefetchUrls;
+            if (!pending || pending.length === 0) return;
+            for (const s of tl.segs) {
+                if (isFinite(s.end) && pending.includes(s.url) && s.end > (streamInfo.SpliceLastEndTime || 0)) {
+                    streamInfo.SpliceLastEndTime = s.end;
+                }
+            }
+        };
+        const kind = streamInfo.TraceReturnKind || 'native';
+        const backupMatch = kind.match(/backup:([A-Za-z0-9_-]+)/);
+        const identity = backupMatch ? 'backup:' + backupMatch[1] + '|' + (streamInfo.ServedBackupUrl || '') : 'native';
+        const prevIdentity = streamInfo.SpliceIdentity;
+        const label = (id) => (id ? id.split('|')[0] : 'none');
+        // A native poll always reveals the native timeline, whatever ends up being served: the
+        // segments the player prefetched from the last served native playlist now carry their
+        // PROGRAM-DATE-TIME here.
+        if (prevIdentity === 'native' && typeof inputText === 'string' && inputText !== outputText) {
+            const nativeTl = parseTimeline(inputText);
+            if (nativeTl) confirmPrefetch(nativeTl);
+        }
+        const tl = parseTimeline(outputText);
+        if (!tl || tl.segs.length === 0 || tl.firstSeq === null) return outputText;
+        const changed = prevIdentity !== identity;
+        if (!changed) confirmPrefetch(tl);
+        let text = outputText;
+        let firstSeq = tl.firstSeq;
+        let skipped = 0;
+        let boundaryDeltaMs = null;
+        let trimNote = '';
+        if (changed && prevIdentity !== null) {
+            // Switching to or away from a backup: continue from the served edge. A native → native
+            // change (new session) starts from scratch.
+            const minimumTime = (backupMatch || prevIdentity.startsWith('backup:')) ? (streamInfo.SpliceLastEndTime || 0) : 0;
+            if (minimumTime > 0 && tl.timed) {
+                let retained = -1;
+                for (let i = 0; i < tl.segs.length; i++) {
+                    const s = tl.segs[i];
+                    if (s.end > minimumTime && (s.time >= minimumTime - HANDOFF_TOLERANCE_MS || (minimumTime - s.time) < (s.end - minimumTime))) {
+                        retained = i;
+                        break;
+                    }
+                }
+                if (retained < 0) {
+                    trimNote = ', new source ends ' + Math.round(minimumTime - tl.segs[tl.segs.length - 1].end) + 'ms behind the served edge — served untrimmed (expect a short replay)';
+                } else if (retained > 0) {
+                    const r = tl.segs[retained];
+                    const prefix = tl.lines.slice(0, r.start).filter((line) => line.startsWith('#') && !SEGMENT_TAG_RE.test(line));
+                    const tail = tl.lines.slice(r.start);
+                    const priorDisc = tail.slice(0, r.uriIndex - r.start).filter((line) => line === '#EXT-X-DISCONTINUITY').length;
+                    setDiscSeq(prefix, r.disc - priorDisc);
+                    const seqIdx = prefix.findIndex((line) => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'));
+                    const seqLine = '#EXT-X-MEDIA-SEQUENCE:' + (firstSeq + retained);
+                    if (seqIdx < 0) prefix.splice(1, 0, seqLine); else prefix[seqIdx] = seqLine;
+                    if (!tail.slice(0, r.uriIndex - r.start).some((line) => line.startsWith('#EXT-X-PROGRAM-DATE-TIME:'))) {
+                        tail.splice(tail.findIndex((line) => line.startsWith('#EXTINF:')), 0, '#EXT-X-PROGRAM-DATE-TIME:' + new Date(r.time).toISOString());
+                    }
+                    text = prefix.concat(tail).join('\n');
+                    firstSeq += retained;
+                    skipped = retained;
+                    boundaryDeltaMs = Math.round(r.time - minimumTime);
+                } else {
+                    boundaryDeltaMs = Math.round(tl.segs[0].time - minimumTime);
+                }
+            } else if (minimumTime > 0) {
+                trimNote = ', segments carry no usable PROGRAM-DATE-TIME — overlap not trimmed';
+            }
+        }
+        if (changed) {
+            const previousLast = streamInfo.SpliceLastDisc;
+            streamInfo.SpliceIdentity = identity;
+            streamInfo.SpliceNativeBoundaries = Object.create(null);
+            streamInfo.SpliceDiscOffset = 0;
+            if (prevIdentity === null) {
+                // First playlist of this player session: nothing to splice against.
+                streamInfo.SpliceBoundarySeq = null;
+                streamInfo.SpliceCount = 0;
+            } else {
+                streamInfo.SpliceBoundarySeq = firstSeq;
+                if (previousLast !== null && isFinite(previousLast)) {
+                    const candidateFirst = discRange(insertBoundary(text, firstSeq, firstSeq, 0)).first;
+                    if (candidateFirst !== null) streamInfo.SpliceDiscOffset = previousLast + 1 - candidateFirst;
+                }
+                streamInfo.SpliceCount = (streamInfo.SpliceCount || 0) + 1;
+            }
+        }
+        let output = text;
+        if (streamInfo.SpliceBoundarySeq !== null) {
+            let boundarySeq = streamInfo.SpliceBoundarySeq;
+            if (!backupMatch && url) {
+                // Each native variant playlist meets the splice at its own first poll.
+                const nb = streamInfo.SpliceNativeBoundaries || (streamInfo.SpliceNativeBoundaries = Object.create(null));
+                if (!(url in nb)) {
+                    const keys = Object.keys(nb);
+                    if (keys.length >= 32) delete nb[keys[0]];
+                    nb[url] = firstSeq;
+                }
+                boundarySeq = nb[url];
+            }
+            output = insertBoundary(text, boundarySeq, firstSeq, streamInfo.SpliceDiscOffset);
+        }
+        const range = discRange(output);
+        if (range.last !== null) {
+            streamInfo.SpliceLastDisc = streamInfo.SpliceLastDisc === null ? range.last : Math.max(streamInfo.SpliceLastDisc, range.last);
+        }
+        const offeredEnd = tl.segs.reduce((m, s) => (isFinite(s.end) ? Math.max(m, s.end) : m), 0);
+        streamInfo.SpliceLastEndTime = Math.max(streamInfo.SpliceLastEndTime || 0, offeredEnd);
+        streamInfo.SplicePrefetchUrls = tl.prefetch;
+        if (changed && prevIdentity !== null) {
+            console.log('[AD DEBUG] Playlist splice #' + streamInfo.SpliceCount + ' ' + label(prevIdentity) + ' → ' + label(identity) + ': skipped ' + skipped + ' already-served segment(s)'
+                + (boundaryDeltaMs === null ? '' : ' (new source picks up ' + (boundaryDeltaMs >= 0 ? '+' : '') + boundaryDeltaMs + 'ms from the served edge)')
+                + ', DISCONTINUITY before seq ' + firstSeq + ', disc-seq offset ' + streamInfo.SpliceDiscOffset
+                + ' (window ' + firstSeq + '-' + (firstSeq + tl.segs.length - skipped - 1) + ', ' + (streamInfo.Urls[url]?.Resolution || '?') + ')' + trimNote);
+        }
+        return output;
+    }
     // A/V desync trace (testing): wraps MediaSource/SourceBuffer in whichever scope owns
     // them (Twitch may run MSE on the main thread or in the worker) and, while isActive()
     // is true, logs per-track buffered ranges plus every timestampOffset change / remove().
@@ -813,7 +1114,17 @@ twitch-videoad.js text/javascript
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                const processedM3u8 = await processM3U8(url, await response.text(), realFetch);
+                                const rawM3u8 = await response.text();
+                                let processedM3u8 = await processM3U8(url, rawM3u8, realFetch);
+                                if (!DisableSpliceDiscontinuity) {
+                                    // v682: splice continuity on the final playlist (see alignPlaylistSplice). Never
+                                    // lets a rewrite failure take the playlist down — the raw result is served instead.
+                                    try {
+                                        processedM3u8 = alignPlaylistSplice(url, rawM3u8, processedM3u8, StreamInfosByUrl[url]);
+                                    } catch (err) {
+                                        console.log('[AD DEBUG] Playlist splice alignment failed — serving the unaligned playlist: ' + err.message);
+                                    }
+                                }
                                 if (AvSyncTrace) {
                                     try { traceM3u8Splice(url, processedM3u8, StreamInfosByUrl[url]); } catch (err) { console.log('[AV TRACE] trace failed: ' + err.message); }
                                 }
@@ -1589,6 +1900,7 @@ twitch-videoad.js text/javascript
             let backupColdTokenFetches = 0;// diag: cold-cache token round-trips this backup search (0 = warm — encodings cache hit)
             let backupPlayerType = null;
             let backupM3u8 = null;
+            let backupM3u8Url = null;// v682: media playlist url of the committed backup (splice identity)
             let fallbackM3u8 = null;
             let startIndex = 0;
             let isDoingMinimalRequests = false;
@@ -1748,6 +2060,7 @@ twitch-videoad.js text/javascript
                                         }
                                         backupPlayerType = playerType;
                                         backupM3u8 = m3u8Text;
+                                        backupM3u8Url = streamM3u8Url;
                                         break;
                                     }
                                     if (hasAdTags(m3u8Text)) {
@@ -1769,6 +2082,7 @@ twitch-videoad.js text/javascript
                                         }
                                         backupPlayerType = playerType;
                                         backupM3u8 = m3u8Text;
+                                        backupM3u8Url = streamM3u8Url;
                                         break;
                                     }
                                 }
@@ -1809,6 +2123,7 @@ twitch-videoad.js text/javascript
                 textStr = backupM3u8;
                 streamInfo.LastCommittedBackupPlayerType = backupPlayerType;
                 streamInfo.TraceReturnKind = 'backup:' + backupPlayerType;
+                streamInfo.ServedBackupUrl = backupM3u8Url;
                 if (streamInfo.ActiveBackupPlayerType != backupPlayerType) {
                     streamInfo.ActiveBackupPlayerType = backupPlayerType;
                     // Auto-pin source-quality backup types (embed, site, popout) to skip failed types on next break.
@@ -3590,6 +3905,11 @@ twitch-videoad.js text/javascript
         if (lsDisableAdOwnedResume === 'true') {
             DisableAdOwnedResume = true;
             console.log('[AD DEBUG] Ad-owned pause handling DISABLED via localStorage — every pause is treated as user intent again; a player Twitch pauses during a break stays paused until you toggle it (A/B isolation)');
+        }
+        const lsDisableSpliceDiscontinuity = localStorage.getItem('twitchAdSolutions_disableSpliceDiscontinuity');
+        if (lsDisableSpliceDiscontinuity === 'true') {
+            DisableSpliceDiscontinuity = true;
+            console.log('[AD DEBUG] Playlist splice continuity DISABLED via localStorage — backup playlists are served raw, with no DISCONTINUITY at the source switch (pre-v682 behaviour, A/B isolation)');
         }
         const lsAvSyncTrace = localStorage.getItem('twitchAdSolutions_avSyncTrace');
         if (lsAvSyncTrace === 'false') {
