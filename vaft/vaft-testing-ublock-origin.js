@@ -37,7 +37,7 @@ twitch-videoad.js text/javascript
         }
     }
     'use strict';
-    const ourTwitchAdSolutionsVersion = 678;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 679;// Used to prevent conflicts with outdated versions of the scripts
     console.log('[AD DEBUG] TwitchAdSolutions vaft-testing v' + ourTwitchAdSolutionsVersion + ' loading');
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log('[AD DEBUG] CONFLICT: vaft-testing v' + ourTwitchAdSolutionsVersion + ' skipped — another script already active (v' + window.twitchAdSolutionsVersion + '). Remove duplicate scripts.');
@@ -85,6 +85,8 @@ twitch-videoad.js text/javascript
         scope.DisableInAdFreezeReload = false;// In-ad frozen-playhead reload escalation — readyState-independent backstop for audio-gap CSAI freezes the gap-seek can't catch (observed ~60s stalls). Default on. Set twitchAdSolutions_disableInAdFreezeReload=true to turn it OFF.
         scope.DisablePostBreakWedge = false;// Post-break video-wedge recovery (mirrors GosuDRM/TTV-AB _checkPostBreakWedge, v12.0.0). Detects "audio running, video frozen" after an ad break — playhead advancing while the decoder emits no new frames — via getVideoPlaybackQuality().totalVideoFrames, which the currentTime-based freeze checks can't see. Default on. Set twitchAdSolutions_disablePostBreakWedge=true to turn it OFF.
         scope.DisableBackgroundResume = false;// Issue #255: resume a Twitch-initiated pause while the tab is hidden (retry chain, strike-capped so a deliberate media-key pause is respected). Default on. Set twitchAdSolutions_disableBackgroundResume=true to turn it OFF.
+        scope.AvSyncTrace = true;// A/V desync diagnostics (testing): [AV TRACE] logs playlist splices, BLANK_MP4 substitutions and per-track SourceBuffer ranges / timestampOffset changes during ad breaks + 30s after. Set twitchAdSolutions_avSyncTrace=false to silence. Call avSyncMark() in the console when you notice desync.
+        scope.AvTraceBlankServed = 0;
         scope.SkipPlayerReloadOnHevc = false;// If true this will skip player reload on streams which have 2k/4k quality (if you enable this and you use the 2k/4k quality setting you'll get error #4000 / #3000 / spinning wheel on chrome based browsers). Despite the name, gates BOTH enhanced families (HEVC and AV1) since v674.
         scope.AlwaysReloadPlayerOnAd = false;// Always pause/play when entering/leaving ads
         scope.ReloadPlayerAfterAd = true;// After the ad finishes do a player reload instead of pause/play
@@ -180,6 +182,10 @@ twitch-videoad.js text/javascript
             EarlyReloadAwaitingResult: false,
             EscapeHatchFired: false,
             LastBreakUsedEscapeHatch: false,
+            // A/V sync trace (testing) — see traceM3u8Splice
+            TraceReturnKind: 'native',// source of the playlist returned this poll: native / backup:<type> / recovery-*
+            TraceState: Object.create(null),// per media-playlist url: last returned source, seq window, seq→url/PDT
+            TraceUntil: 0,// keep tracing this long after the break ends (post-break reload window)
             FastAutoplayConsecutive: 0,// Re-probe counter — periodic full Source-tier probe to catch channel recovery.
             // Reload cooldown
             LastPlayerReload: 0,
@@ -336,6 +342,8 @@ twitch-videoad.js text/javascript
                     ${getServerTimeFromM3u8.toString()}
                     ${replaceServerTimeInM3u8.toString()}
                     ${createStreamInfo.toString()}
+                    ${traceM3u8Splice.toString()}
+                    ${hookAvSyncTrace.toString()}
                     const workerString = getWasmWorkerJs('${twitchBlobUrl.replaceAll("'", "%27")}');
                     declareOptions(self);
                     ReloadPlayerAfterAd = ${ReloadPlayerAfterAd};
@@ -348,6 +356,7 @@ twitch-videoad.js text/javascript
                     BackupSwapFirst = ${BackupSwapFirst};
                     DisableAdSpoofing = ${DisableAdSpoofing};
                     SoftReloadNoStrip = ${SoftReloadNoStrip};
+                    AvSyncTrace = ${AvSyncTrace};
                     ForceAccessTokenPlayerType = '${ForceAccessTokenPlayerType}';
                     GQLDeviceID = ${GQLDeviceID ? "'" + GQLDeviceID + "'" : null};
                     AuthorizationHeader = ${AuthorizationHeader ? "'" + AuthorizationHeader + "'" : undefined};
@@ -419,11 +428,23 @@ twitch-videoad.js text/javascript
                         } else if (e.data.key == 'SimulateAds') {
                             SimulatedAdsDepth = e.data.value;
                             console.log('SimulatedAdsDepth: ' + SimulatedAdsDepth);
+                        } else if (e.data.key == 'AvSyncMark') {
+                            if (self.__tasAvTraceSample) self.__tasAvTraceSample(true);
                         } else if (e.data.key == 'AllSegmentsAreAdSegments') {
                             AllSegmentsAreAdSegments = !AllSegmentsAreAdSegments;
                             console.log('AllSegmentsAreAdSegments: ' + AllSegmentsAreAdSegments);
                         }
                     });
+                    if (AvSyncTrace) {
+                        hookAvSyncTrace(self, 'worker', function() {
+                            const now = Date.now();
+                            for (const c in StreamInfos) {
+                                const si = StreamInfos[c];
+                                if (si && (si.IsShowingAd || now < si.TraceUntil)) return true;
+                            }
+                            return false;
+                        }, null);
+                    }
                     hookWorkerFetch();
                     // Guard the eval — malformed workerString shouldn't silently break
                     // Twitch's player logic without a diagnostic.
@@ -457,6 +478,9 @@ twitch-videoad.js text/javascript
                             if (!e.data.hasAds) {
                                 playerBufferState.position = 0;
                             }
+                        }
+                        if (playerBufferState.inAdBreak && !e.data.hasAds) {
+                            playerBufferState.avTraceUntil = Date.now() + 30000;
                         }
                         playerBufferState.inAdBreak = !!e.data.hasAds;
                         // Clear drift catch-up when ads start — don't run 1.1x during ad handling
@@ -536,6 +560,206 @@ twitch-videoad.js text/javascript
         req.send();
         return req.responseText;
     }
+    // A/V desync trace (testing, twitchAdSolutions_avSyncTrace): logs every point where
+    // the media playlist handed to the player changes source (native / backup:<type> /
+    // recovery replay) or its media sequence jumps, and whether the same sequence number
+    // now maps to a different segment URL or PROGRAM-DATE-TIME. None of these splices
+    // carry an EXT-X-DISCONTINUITY, so a timeline mismatch logged here is a candidate for
+    // mid-break audio drift. Serialized into the worker blob — no outer-scope references.
+    function traceM3u8Splice(url, text, streamInfo) {
+        if (!streamInfo || typeof text !== 'string') return;
+        const kind = streamInfo.TraceReturnKind || 'native';
+        const lines = text.split(/\r?\n/);
+        let mediaSeq = NaN;
+        let discSeq = 0;
+        let discTags = 0;
+        let pendingPdt = null;
+        const segs = [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+                mediaSeq = parseInt(line.substring(22), 10);
+            } else if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) {
+                discSeq = parseInt(line.substring(30), 10) || 0;
+            } else if (line === '#EXT-X-DISCONTINUITY') {
+                discTags++;
+            } else if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+                pendingPdt = Date.parse(line.substring(25)) || null;
+            } else if (line.startsWith('#EXTINF') && i + 1 < lines.length) {
+                const segUrl = lines[i + 1];
+                segs.push({ url: segUrl, live: line.includes(',live'), blank: AdSegmentCache.has(segUrl), pdt: pendingPdt, dur: parseFloat(line.substring(8)) || 0 });
+                pendingPdt = null;
+            }
+        }
+        if (isNaN(mediaSeq) || segs.length === 0) return;
+        const endSeq = mediaSeq + segs.length - 1;
+        const blankCount = segs.filter((s) => s.blank).length;
+        const st = streamInfo.TraceState[url] || (streamInfo.TraceState[url] = { kind: null, mediaSeq: NaN, endSeq: NaN, blank: 0, disc: 0, lastPdt: null, bySeq: Object.create(null) });
+        const sourceChanged = st.kind !== null && st.kind !== kind;
+        const events = [];
+        if (sourceChanged) {
+            events.push('SPLICE ' + st.kind + ' → ' + kind);
+            // Where does the new source's timeline pick up relative to what the player just had?
+            if (st.lastPdt) {
+                let best = null;
+                for (let j = 0; j < segs.length; j++) {
+                    if (segs[j].pdt && (!best || Math.abs(segs[j].pdt - st.lastPdt) < Math.abs(best.pdt - st.lastPdt))) {
+                        best = { seq: mediaSeq + j, pdt: segs[j].pdt };
+                    }
+                }
+                if (best) {
+                    events.push('prev last seg ' + st.endSeq + ' ≈ new seq ' + best.seq + ' by PDT (Δseq ' + (best.seq - st.endSeq) + ', ΔPDT ' + (best.pdt - st.lastPdt) + 'ms)');
+                }
+            }
+        }
+        if (!isNaN(st.mediaSeq)) {
+            if (mediaSeq < st.mediaSeq) {
+                events.push('MEDIA-SEQUENCE went BACKWARDS ' + st.mediaSeq + ' → ' + mediaSeq);
+            } else if (mediaSeq > st.endSeq + 1) {
+                events.push('sequence GAP — prev ended ' + st.endSeq + ', now starts ' + mediaSeq + ' (' + (mediaSeq - st.endSeq - 1) + ' segs never offered)');
+            }
+        }
+        // Same sequence number, different content: the player may already have buffered seq N from the other source
+        let urlSwaps = 0;
+        let pdtShift = 0;
+        for (let j = 0; j < segs.length; j++) {
+            const prev = st.bySeq[mediaSeq + j];
+            if (!prev) continue;
+            if (prev.url !== segs[j].url) urlSwaps++;
+            if (prev.pdt && segs[j].pdt && Math.abs(segs[j].pdt - prev.pdt) > Math.abs(pdtShift)) pdtShift = segs[j].pdt - prev.pdt;
+        }
+        if (urlSwaps > 0) events.push(urlSwaps + ' overlapping seq(s) now point at different segment URLs');
+        if (Math.abs(pdtShift) >= 50) events.push('PDT for the same seq shifted ' + pdtShift + 'ms (timelines NOT aligned)');
+        if (blankCount !== st.blank) events.push('BLANK_MP4-backed segs in window ' + st.blank + ' → ' + blankCount);
+        if (discTags !== st.disc) events.push('DISCONTINUITY tags ' + st.disc + ' → ' + discTags + ' (disc-seq ' + discSeq + ')');
+        const inWindow = streamInfo.IsShowingAd || Date.now() < streamInfo.TraceUntil;
+        if (events.length > 0 && (inWindow || sourceChanged)) {
+            const first = segs[0];
+            console.log('[AV TRACE] (worker) ' + streamInfo.ChannelName + ' ' + (streamInfo.Urls[url]?.Resolution || '?') + ' | ' + events.join(' | ') + ' || window seq ' + mediaSeq + '-' + endSeq + ', ' + segs.filter((s) => s.live).length + '/' + segs.length + ' live, ' + blankCount + ' blank, first PDT ' + (first.pdt ? new Date(first.pdt).toISOString().substring(11, 23) : 'n/a') + ', src ' + kind);
+        }
+        const last = segs[segs.length - 1];
+        st.kind = kind;
+        st.mediaSeq = mediaSeq;
+        st.endSeq = endSeq;
+        st.blank = blankCount;
+        st.disc = discTags;
+        st.lastPdt = last.pdt;
+        const bySeq = Object.create(null);
+        for (let j = 0; j < segs.length; j++) {
+            bySeq[mediaSeq + j] = { url: segs[j].url, pdt: segs[j].pdt };
+        }
+        st.bySeq = bySeq;
+    }
+    // A/V desync trace (testing): wraps MediaSource/SourceBuffer in whichever scope owns
+    // them (Twitch may run MSE on the main thread or in the worker) and, while isActive()
+    // is true, logs per-track buffered ranges plus every timestampOffset change / remove().
+    // Audio and video ranges that stop lining up after a splice mean the desync is baked
+    // into the appended media (only a MediaSource flush fixes that), not the renderer.
+    // Serialized into the worker blob — no outer-scope references.
+    function hookAvSyncTrace(scope, where, isActive, getVideo) {
+        if (!scope.MediaSource || !scope.SourceBuffer || scope.__tasAvTraceHooked) return;
+        scope.__tasAvTraceHooked = true;
+        const tag = '[AV TRACE] (' + where + ') ';
+        const tracked = [];
+        const fmt = (n) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(3) : String(n);
+        const active = () => { try { return !!isActive(); } catch { return false; } };
+        const rangesOf = (sb) => {
+            const out = [];
+            try {
+                const b = sb.buffered;
+                for (let i = 0; i < b.length; i++) out.push([b.start(i), b.end(i)]);
+            } catch {}
+            return out;
+        };
+        let logBudget = 40;
+        let budgetResetAt = 0;
+        const spend = () => {
+            const now = Date.now();
+            if (now > budgetResetAt) { logBudget = 40; budgetResetAt = now + 10000; }
+            return logBudget-- > 0;
+        };
+        const origAdd = scope.MediaSource.prototype.addSourceBuffer;
+        scope.MediaSource.prototype.addSourceBuffer = function(mime) {
+            const sb = origAdd.apply(this, arguments);
+            try {
+                const m = String(mime);
+                const codecs = (m.match(/codecs\s*=\s*"?([^"]*)"?/i) || [])[1] || '';
+                const hasAudio = /mp4a|opus|ac-3|ec-3|flac/i.test(codecs) || (!codecs && /^audio\//i.test(m));
+                const hasVideo = /avc|hvc|hev|av01|vp0?[89]/i.test(codecs) || (!codecs && /^video\//i.test(m));
+                const kind = hasAudio && hasVideo ? 'muxed' : hasAudio ? 'audio' : hasVideo ? 'video' : 'other';
+                // New MediaSource instance (hard reload): forget the previous one's buffers
+                for (let i = tracked.length - 1; i >= 0; i--) {
+                    if (tracked[i].ms !== this) tracked.splice(i, 1);
+                }
+                tracked.push({ sb: sb, ms: this, kind: kind });
+                sb.__tasAvKind = kind;
+                console.log(tag + 'SourceBuffer added: ' + kind + ' (' + m + ')');
+            } catch {}
+            return sb;
+        };
+        const tsDesc = Object.getOwnPropertyDescriptor(scope.SourceBuffer.prototype, 'timestampOffset');
+        if (tsDesc && tsDesc.get && tsDesc.set) {
+            Object.defineProperty(scope.SourceBuffer.prototype, 'timestampOffset', {
+                configurable: true,
+                enumerable: tsDesc.enumerable,
+                get: function() { return tsDesc.get.call(this); },
+                set: function(v) {
+                    let before;
+                    try { before = tsDesc.get.call(this); } catch {}
+                    tsDesc.set.call(this, v);
+                    try {
+                        if (typeof before === 'number' && Math.abs(v - before) > 0.0005 && active() && spend()) {
+                            console.log(tag + (this.__tasAvKind || '?') + ' timestampOffset ' + fmt(before) + ' → ' + fmt(v) + ' (Δ ' + fmt(v - before) + 's)');
+                        }
+                    } catch {}
+                }
+            });
+        }
+        const origRemove = scope.SourceBuffer.prototype.remove;
+        scope.SourceBuffer.prototype.remove = function(start, end) {
+            try {
+                if (active() && spend()) console.log(tag + (this.__tasAvKind || '?') + ' remove(' + fmt(start) + ', ' + fmt(end) + ')');
+            } catch {}
+            return origRemove.apply(this, arguments);
+        };
+        const sample = (force) => {
+            if (!force && !active()) return;
+            const live = tracked.filter((t) => { try { return t.ms.readyState !== 'closed'; } catch { return false; } });
+            if (live.length === 0) return;
+            const video = getVideo ? getVideo() : null;
+            const t = video ? video.currentTime : NaN;
+            const parts = [];
+            const at = {};
+            for (const tr of live) {
+                const r = rangesOf(tr.sb);
+                let mode = '?';
+                let off = NaN;
+                try { mode = tr.sb.mode; off = tr.sb.timestampOffset; } catch {}
+                parts.push(tr.kind + ' [' + (r.length ? r.map((x) => fmt(x[0]) + '-' + fmt(x[1])).join(', ') : 'empty') + '] off=' + fmt(off) + (mode !== 'segments' ? ' mode=' + mode : ''));
+                const cur = isNaN(t) ? (r[r.length - 1] || null) : (r.find((x) => x[0] <= t + 0.1 && x[1] >= t) || null);
+                at[tr.kind] = { cur: cur, n: r.length };
+            }
+            let skew = '';
+            if (at.audio && at.video) {
+                if (at.audio.cur && at.video.cur) {
+                    skew = ' | A−V skew: start ' + fmt(at.audio.cur[0] - at.video.cur[0]) + 's, end ' + fmt(at.audio.cur[1] - at.video.cur[1]) + 's';
+                } else {
+                    skew = ' | playhead range: audio ' + (at.audio.cur ? 'ok' : 'GAP') + ', video ' + (at.video.cur ? 'ok' : 'GAP');
+                }
+                if (at.audio.n !== at.video.n) skew += ' | range count A' + at.audio.n + '/V' + at.video.n + ' (gap in one track only)';
+            }
+            let quality = '';
+            try {
+                if (video && video.getVideoPlaybackQuality) {
+                    const pq = video.getVideoPlaybackQuality();
+                    quality = ' | dropped ' + pq.droppedVideoFrames + '/' + pq.totalVideoFrames;
+                }
+            } catch {}
+            console.log(tag + (isNaN(t) ? '' : 't=' + fmt(t) + ' ') + parts.join(' || ') + skew + quality);
+        };
+        scope.__tasAvTraceSample = sample;
+        setInterval(() => sample(false), 2000);
+    }
     // Hook fetch() in the worker scope to intercept m3u8 playlist requests and ad segments
     function hookWorkerFetch() {
         console.log('[AD DEBUG] hookWorkerFetch (vaft)');
@@ -561,6 +785,10 @@ twitch-videoad.js text/javascript
                         }
                         return new Response('', { status: 403, statusText: 'ad segment blocked' });
                     }
+                    if (AvSyncTrace) {
+                        AvTraceBlankServed++;
+                        console.log('[AV TRACE] (worker) BLANK_MP4 served #' + AvTraceBlankServed + ' for ' + url.slice(-60) + ' — zero-sample segment where the playlist promises media');
+                    }
                     return new Response(BLANK_MP4);
                 }
                 url = url.trimEnd();
@@ -568,7 +796,11 @@ twitch-videoad.js text/javascript
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                resolve(new Response(await processM3U8(url, await response.text(), realFetch)));
+                                const processedM3u8 = await processM3U8(url, await response.text(), realFetch);
+                                if (AvSyncTrace) {
+                                    try { traceM3u8Splice(url, processedM3u8, StreamInfosByUrl[url]); } catch (err) { console.log('[AV TRACE] trace failed: ' + err.message); }
+                                }
+                                resolve(new Response(processedM3u8));
                             } else {
                                 resolve(response);
                             }
@@ -982,11 +1214,13 @@ twitch-videoad.js text/javascript
             if (streamInfo.LastCleanNativeM3U8 && snapshotAge <= 1500 && !recentReloadReentry && !hasAdTags(streamInfo.LastCleanNativeM3U8)) {
                 console.log('[AD DEBUG] All segments stripped — reusing last clean native playlist (' + snapshotAge + 'ms old)');
                 streamInfo.IsStrippingAdSegments = hasStrippedAdSegments;
+                streamInfo.TraceReturnKind = 'native-snapshot(during ' + (streamInfo.TraceReturnKind || 'native') + ')';
                 return streamInfo.LastCleanNativeM3U8;
             }
             // Fallback: per-segment recovery cache (existing behavior)
             if (streamInfo.RecoverySegments && streamInfo.RecoverySegments.length > 0) {
                 console.log('[AD DEBUG] All segments stripped — restoring ' + streamInfo.RecoverySegments.length + ' recovery segments');
+                streamInfo.TraceReturnKind = 'recovery-replay(' + (streamInfo.TraceReturnKind || 'native') + ')';
                 if (streamInfo.RecoveryStartSeq !== undefined) {
                     for (let j = 0; j < lines.length; j++) {
                         if (lines[j].startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
@@ -1141,6 +1375,7 @@ twitch-videoad.js text/javascript
         if (!streamInfo) {
             return textStr;
         }
+        streamInfo.TraceReturnKind = 'native';
         if (HasTriggeredPlayerReload) {
             HasTriggeredPlayerReload = false;
             streamInfo.LastPlayerReload = Date.now();
@@ -1556,6 +1791,7 @@ twitch-videoad.js text/javascript
             if (backupM3u8 && streamInfo.IsShowingAd) {
                 textStr = backupM3u8;
                 streamInfo.LastCommittedBackupPlayerType = backupPlayerType;
+                streamInfo.TraceReturnKind = 'backup:' + backupPlayerType;
                 if (streamInfo.ActiveBackupPlayerType != backupPlayerType) {
                     streamInfo.ActiveBackupPlayerType = backupPlayerType;
                     // Auto-pin source-quality backup types (embed, site, popout) to skip failed types on next break.
@@ -1710,6 +1946,7 @@ twitch-videoad.js text/javascript
                 streamInfo.HasLoggedUnknownSignifiers = false;
                 streamInfo.LoggedFastAutoplayThisBreak = false;
                 streamInfo.LoggedFastAutoplayReprobeThisBreak = false;
+                streamInfo.TraceUntil = Date.now() + 30000;
                 streamInfo.SawCSAIFastPath = false;// Clear sticky CSAI flag for next break
                 streamInfo.EscapeHatchFired = false;
                 // Auto-escalate cooldown: if 3+ reloads in last 2 min, triple the cooldown to reduce cascade pressure
@@ -3092,6 +3329,11 @@ twitch-videoad.js text/javascript
             DisableBackgroundResume = true;
             console.log('[AD DEBUG] Background resume DISABLED via localStorage — a hidden-tab pause during ads stays paused until tab focus (A/B isolation)');
         }
+        const lsAvSyncTrace = localStorage.getItem('twitchAdSolutions_avSyncTrace');
+        if (lsAvSyncTrace === 'false') {
+            AvSyncTrace = false;
+            console.log('[AD DEBUG] A/V sync trace disabled via localStorage');
+        }
         const lsHideAdOverlay = localStorage.getItem('twitchAdSolutions_hideAdOverlay');
         if (lsHideAdOverlay === 'true') {
             const style = document.createElement('style');
@@ -3100,6 +3342,9 @@ twitch-videoad.js text/javascript
         }
     } catch {}
     console.log('[AD DEBUG] Config: ReloadPlayerAfterAd = ' + ReloadPlayerAfterAd + ', ForceAccessTokenPlayerType = ' + ForceAccessTokenPlayerType + ', PinBackupPlayerType = ' + PinBackupPlayerType);
+    if (AvSyncTrace) {
+        hookAvSyncTrace(window, 'main', () => !!playerBufferState.inAdBreak || Date.now() < (playerBufferState.avTraceUntil || 0), () => document.querySelector('video'));
+    }
     hookWindowWorker();
     hookFetch();
     if (PlayerBufferingFix) {
@@ -3118,6 +3363,12 @@ twitch-videoad.js text/javascript
             return;
         }
         postTwitchWorkerMessage('SimulateAds', depth);
+    };
+    window.avSyncMark = (note) => {
+        console.log('[AV TRACE] USER MARK — ' + (note || 'desync noticed') + ' @ ' + new Date().toISOString());
+        playerBufferState.avTraceUntil = Math.max(playerBufferState.avTraceUntil || 0, Date.now() + 30000);
+        if (window.__tasAvTraceSample) window.__tasAvTraceSample(true);
+        postTwitchWorkerMessage('AvSyncMark');
     };
     window.allSegmentsAreAdSegments = () => {
         postTwitchWorkerMessage('AllSegmentsAreAdSegments');
