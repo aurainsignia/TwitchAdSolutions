@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft-testing)
 // @namespace    https://github.com/ryanbr/TwitchAdSolutions
-// @version      679.0.0
+// @version      680.0.0
 // @description  Multiple solutions for blocking Twitch ads (vaft testing variant)
-// @updateURL    https://github.com/ryanbr/TwitchAdSolutions/raw/master/vaft/vaft_testing.user.js
-// @downloadURL  https://github.com/ryanbr/TwitchAdSolutions/raw/master/vaft/vaft_testing.user.js
+// @updateURL    https://github.com/aurainsignia/TwitchAdSolutions/raw/master/vaft/vaft_testing.user.js
+// @downloadURL  https://github.com/aurainsignia/TwitchAdSolutions/raw/master/vaft/vaft_testing.user.js
 // @author       https://github.com/cleanlock/VideoAdBlockForTwitch#credits
 // @match        *://*.twitch.tv/*
 // @run-at       document-start
@@ -48,7 +48,7 @@
         }
     }
     'use strict';
-    const ourTwitchAdSolutionsVersion = 679;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 680;// Used to prevent conflicts with outdated versions of the scripts
     console.log('[AD DEBUG] TwitchAdSolutions vaft-testing v' + ourTwitchAdSolutionsVersion + ' loading');
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log('[AD DEBUG] CONFLICT: vaft-testing v' + ourTwitchAdSolutionsVersion + ' skipped — another script already active (v' + window.twitchAdSolutionsVersion + '). Remove duplicate scripts.');
@@ -492,6 +492,23 @@
                         }
                         if (playerBufferState.inAdBreak && !e.data.hasAds) {
                             playerBufferState.avTraceUntil = Date.now() + 30000;
+                        }
+                        if (e.data.hasAds && !playerBufferState.inAdBreak) {
+                            // Ad-start edge: remember that playback should come back after the break
+                            // (mirrors TTV-AB _rememberPlayerPlaybackForAd).
+                            armAdResumeIntent(getPlayerAndState()?.player?.getHTMLVideoElement?.());
+                        } else if (e.data.hasAds) {
+                            playerBufferState.adResumeIntentUntil = Date.now() + AdResumeIntentWindowMs;
+                        } else if (playerBufferState.inAdBreak) {
+                            // Ad-end edge: open the post-break window and resume a Twitch-paused player
+                            // now. The worker's ReloadPlayer / PauseResumePlayer (if any) arrived just
+                            // before this message; a CSAI-only break sends no player action at all.
+                            playerBufferState.adResumeIntentUntil = Date.now() + AdResumeIntentWindowMs;
+                            playerBufferState.adOwnedResumeChains = 0;
+                            playerBufferState.adOwnedPauseLogged = false;
+                            playerBufferState.adResumeWatchdogAttempts = 0;
+                            playerBufferState.adResumeWatchdogExhaustedLogged = false;
+                            resumePlayerAfterAdIfNeeded('after the ad break');
                         }
                         playerBufferState.inAdBreak = !!e.data.hasAds;
                         // Clear drift catch-up when ads start — don't run 1.1x during ad handling
@@ -2164,6 +2181,18 @@
         numSame: 0,
         fixAttempts: 0,
         lastFixTime: 0,
+        // Ad-owned pause handling — see initPlaybackControlInteractionMonitor / scheduleAdOwnedResume
+        userPausedAt: 0,
+        userPausedHadExplicitInteraction: false,
+        lastPlaybackControlInteractionAt: 0,
+        adResumeIntent: false,// playback should come back after the current / just-ended break
+        adResumeIntentUntil: 0,
+        adOwnedResumeChains: 0,
+        adOwnedResumeTimers: [],
+        adOwnedPauseLogged: false,
+        adResumeWatchdogAttempts: 0,
+        adResumeWatchdogExhaustedLogged: false,
+        lastAdResumeAt: 0,
         isLive: true
     };
     // play() hands back a promise whose rejection tells apart the browser refusing the call
@@ -2215,6 +2244,178 @@
             }, delay));
         }
     }
+    // Ad-owned pause handling (mirrors GosuDRM/TTV-AB "Late Ad-Pause Recovery Suppression" /
+    // "Early-Ad User Pause Override" / "Post-Ad Player Pause Fix"). Twitch's own player pauses
+    // the <video> during an ad break — an ad-transition pause fired while vaft is already
+    // serving the backup playlist — and nothing in Twitch resumes it, because the ad it is
+    // waiting on never plays. The pause listener used to read every pause in a visible tab as
+    // the user's, so every auto-resume path (break-end pause/play, break-end reload, buffer
+    // monitor) then deferred to "user intent" and the stream sat paused until the user toggled
+    // pause/play by hand.
+    // A pause is the user's only when it follows an explicit playback interaction within the
+    // last 1200ms: the player's play/pause control, a click on the video surface, Space/K, or a
+    // media key (Twitch registers those through navigator.mediaSession). A no-interaction pause
+    // during a break, or in the 15s post-break window, is ad-owned: resumed with a short retry
+    // chain (strike-capped so vaft never fights Twitch indefinitely), and resumed again at break
+    // end if it is still paused. The resume intent is armed on the ad-start edge and dropped the
+    // moment the user pauses explicitly, so a deliberate mid-break pause stays paused.
+    const PlaybackControlInteractionWindowMs = 1200;
+    const AdTransientPauseClearWindowMs = 1750;// a no-interaction pause this close before ad detection is the ad's early transition pause
+    const AdResumeIntentWindowMs = 15000;// post-break window during which a still-paused player is resumed
+    const AdOwnedResumeRetryDelaysMs = [150, 600, 1800, 4000];
+    const AdOwnedResumeMaxChains = 2;// per break, and again per post-break window
+    const AdResumeWatchdogMaxAttempts = 3;// buffer-monitor retries per post-break window
+    const PlayerControlInteractionSelector = '[data-a-target="player-play-pause-button"], [data-a-target="player-overlay-play-button"], [data-a-target="player-overlay-click-handler"], [data-a-target="video-player"], video';
+    function isEditableInteractionTarget(target) {
+        if (!(target instanceof Element)) return false;
+        if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+        if (target instanceof HTMLElement && target.isContentEditable) return true;
+        return !!target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
+    }
+    function hasPlaybackControlAriaLabel(node) {
+        if (!(node instanceof Element)) return false;
+        const label = (node.getAttribute('aria-label') || '').toLowerCase();
+        return label.includes('pause') || label.includes('play') || label.includes('resume');
+    }
+    function isLikelyPlaybackControlInteraction(event) {
+        if (!event) return false;
+        if (event.type === 'keydown') {
+            if (isEditableInteractionTarget(event.target)) return false;
+            const key = typeof event.key === 'string' ? event.key.toLowerCase() : '';
+            return event.code === 'Space' || event.code === 'KeyK' || key === ' ' || key === 'spacebar' || key === 'k' || key === 'mediaplaypause';
+        }
+        if (typeof event.button === 'number' && event.button !== 0 && event.pointerType !== 'touch' && event.pointerType !== 'pen') return false;
+        const target = event.target;
+        if (!(target instanceof Element) || isEditableInteractionTarget(target)) return false;
+        if (target.closest(PlayerControlInteractionSelector)) return true;
+        if (hasPlaybackControlAriaLabel(target.closest('button, [role="button"]'))) return true;
+        const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+        for (const node of path) {
+            if (node instanceof Element && (node.matches(PlayerControlInteractionSelector) || hasPlaybackControlAriaLabel(node))) return true;
+        }
+        return false;
+    }
+    function rememberPlaybackControlInteraction() {
+        playerBufferState.lastPlaybackControlInteractionAt = Date.now();
+    }
+    function hasRecentPlaybackControlInteraction() {
+        const at = playerBufferState.lastPlaybackControlInteractionAt || 0;
+        return at > 0 && (Date.now() - at) <= PlaybackControlInteractionWindowMs;
+    }
+    function initPlaybackControlInteractionMonitor() {
+        if (playerBufferState.interactionMonitorInitialized) return;
+        playerBufferState.interactionMonitorInitialized = true;
+        const remember = (event) => {
+            try { if (isLikelyPlaybackControlInteraction(event)) rememberPlaybackControlInteraction(); } catch {}
+        };
+        window.addEventListener('pointerdown', remember, true);
+        window.addEventListener('keydown', remember, true);
+        // Media keys / OS media controls reach Twitch through navigator.mediaSession — wrap the
+        // handlers Twitch registers so a hardware pause counts as an explicit interaction.
+        try {
+            const mediaSession = navigator.mediaSession;
+            if (mediaSession && typeof mediaSession.setActionHandler === 'function' && !mediaSession.__tasIntentPatched) {
+                mediaSession.__tasIntentPatched = true;
+                const realSetActionHandler = mediaSession.setActionHandler;
+                mediaSession.setActionHandler = function(action, handler) {
+                    const tracked = (action === 'play' || action === 'pause' || action === 'stop') && typeof handler === 'function';
+                    const wrapped = tracked ? function(details) {
+                        rememberPlaybackControlInteraction();
+                        if (action === 'play') {
+                            playerBufferState.userPauseIntent = false;
+                            playerBufferState.loggedPauseIntent = false;
+                        } else {
+                            recordUserPause(true);
+                        }
+                        return handler.call(this, details);
+                    } : handler;
+                    return realSetActionHandler.call(this, action, wrapped);
+                };
+            }
+        } catch {}
+    }
+    function recordUserPause(explicit) {
+        playerBufferState.userPauseIntent = true;
+        playerBufferState.userPausedAt = Date.now();
+        playerBufferState.userPausedHadExplicitInteraction = explicit;
+        if (explicit) {
+            playerBufferState.adResumeIntent = false;// the user does not want playback back after the break
+            clearAdOwnedResumeTimers();
+            clearBackgroundResumeTimers();
+        }
+    }
+    function armAdResumeIntent(video) {
+        // A no-interaction pause just before the ad was detected is the ad's early transition
+        // pause, not the user's — clear it first (TTV-AB _AD_TRANSIENT_PAUSE_CLEAR_WINDOW_MS).
+        if (playerBufferState.userPauseIntent && !playerBufferState.userPausedHadExplicitInteraction
+            && (Date.now() - (playerBufferState.userPausedAt || 0)) <= AdTransientPauseClearWindowMs) {
+            console.log('[AD DEBUG] Pause ' + (Date.now() - playerBufferState.userPausedAt) + 'ms before ad detection had no user interaction — treating it as the ad transition pause, not user intent');
+            playerBufferState.userPauseIntent = false;
+            playerBufferState.loggedPauseIntent = false;
+        }
+        playerBufferState.adOwnedResumeChains = 0;
+        playerBufferState.adOwnedPauseLogged = false;
+        playerBufferState.adResumeIntent = !playerBufferState.userPauseIntent && !(video && video.ended);
+        playerBufferState.adResumeIntentUntil = Date.now() + AdResumeIntentWindowMs;
+    }
+    function hasPendingAdResumeIntent() {
+        if (!playerBufferState.adResumeIntent) return false;
+        if (playerBufferState.inAdBreak) return true;
+        if (Date.now() < (playerBufferState.adResumeIntentUntil || 0)) return true;
+        playerBufferState.adResumeIntent = false;
+        return false;
+    }
+    function isAdOwnedPauseContext() {
+        return !!playerBufferState.inAdBreak || hasPendingAdResumeIntent();
+    }
+    function clearAdOwnedResumeTimers() {
+        for (const t of (playerBufferState.adOwnedResumeTimers || [])) clearTimeout(t);
+        playerBufferState.adOwnedResumeTimers = [];
+    }
+    // play() through Twitch's wrapper first so its React state follows; fall back to the element
+    // when the wrapper thinks it is already playing — a paused element under a "playing" UI is
+    // exactly the state the manual pause/unpause workaround was resetting.
+    function resumeAdOwnedPause(video, context) {
+        if (playerBufferState.userPauseIntent) return;
+        const player = getPlayerAndState()?.player;
+        const current = player?.getHTMLVideoElement?.() || video;
+        if (!current || !current.isConnected || current.ended || !current.paused) return;
+        if (player && typeof player.play === 'function') playPlayer(player, context);
+        if (current.paused) playPlayer(current, context + ' (element)');
+    }
+    function scheduleAdOwnedResume(video, context) {
+        if ((playerBufferState.adOwnedResumeChains || 0) >= AdOwnedResumeMaxChains) {
+            if (!playerBufferState.adOwnedPauseLogged) {
+                playerBufferState.adOwnedPauseLogged = true;
+                console.log('[AD DEBUG] Twitch keeps pausing the player ' + context + ' (' + AdOwnedResumeMaxChains + ' resume chains) — leaving it paused until the break ends, then resuming');
+            }
+            return;
+        }
+        playerBufferState.adOwnedResumeChains = (playerBufferState.adOwnedResumeChains || 0) + 1;
+        clearAdOwnedResumeTimers();
+        console.log('[AD DEBUG] Twitch paused the player ' + context + ' with no user interaction — ad-owned pause, resuming (chain ' + playerBufferState.adOwnedResumeChains + '/' + AdOwnedResumeMaxChains + ')');
+        resumeAdOwnedPause(video, 'ad-owned pause');
+        for (const delay of AdOwnedResumeRetryDelaysMs) {
+            playerBufferState.adOwnedResumeTimers.push(setTimeout(() => resumeAdOwnedPause(video, 'ad-owned pause retry'), delay));
+        }
+    }
+    // Break-end resume: whatever the worker decided (reload, pause/play, or — on a CSAI-only
+    // break — no player action at all), a player Twitch paused during the break must not stay
+    // paused. Skipped for 3s after a reload (that path resumes on its own) and never against a
+    // user's own pause.
+    function resumePlayerAfterAdIfNeeded(context) {
+        if (!hasPendingAdResumeIntent() || playerBufferState.userPauseIntent) return false;
+        const player = getPlayerAndState()?.player;
+        const video = player?.getHTMLVideoElement?.();
+        if (!video || video.ended || !video.paused) return false;
+        const now = Date.now();
+        if (playerBufferState.lastReloadAt && (now - playerBufferState.lastReloadAt) < 3000) return false;
+        if (playerBufferState.lastAdResumeAt && (now - playerBufferState.lastAdResumeAt) < 1500) return false;
+        playerBufferState.lastAdResumeAt = now;
+        console.log('[AD DEBUG] Player still paused ' + context + ' and the pause did not come from the user — resuming');
+        resumeAdOwnedPause(video, 'post-ad resume');
+        return true;
+    }
     // Poll the player state to detect and fix buffering caused by ad stream switching
     function monitorPlayerBuffering() {
         // Always reschedule the next tick, even if the body throws — a single unexpected
@@ -2240,13 +2441,26 @@
                         if (playerBufferState.weJustPaused && (Date.now() - playerBufferState.weJustPaused) <= 2000) {
                             return;// our own pause (pause/play fix, MSE-teardown) — not user intent
                         }
+                        if (hasRecentPlaybackControlInteraction()) {
+                            // Explicit: the play/pause control, the video surface, Space/K or a media key
+                            // within the last 1200ms. The user's — respected everywhere, hidden tab included.
+                            recordUserPause(true);
+                            return;
+                        }
+                        if (isAdOwnedPauseContext()) {
+                            // No interaction, during a break or the post-break window: Twitch's own
+                            // ad-transition pause. Nothing in Twitch resumes it once the ad it was
+                            // waiting on is blocked — resume it (bounded), and again at break end.
+                            scheduleAdOwnedResume(video, playerBufferState.inAdBreak ? 'during an ad break' : 'right after an ad break');
+                            return;
+                        }
                         if (document.hidden && !DisableBackgroundResume) {
                             // A hidden-tab pause can't be the player's pause button — it's Twitch
                             // pausing a background tab at ad time (issue #255), not user intent.
                             scheduleBackgroundResume(video);
                             return;
                         }
-                        playerBufferState.userPauseIntent = true;
+                        recordUserPause(false);
                     });
                     video.addEventListener('play', () => {
                         playerBufferState.userPauseIntent = false;
@@ -2277,6 +2491,8 @@
                               playerBufferState.recoveryReloadUsed = false;
                               playerBufferState.userPauseIntent = false;
                         playerBufferState.loggedPauseIntent = false;
+                              playerBufferState.adResumeIntent = false;
+                              clearAdOwnedResumeTimers();
                           }
                       }
                     }
@@ -2570,6 +2786,27 @@
                 } catch {}
             }
         }
+        // Post-break resume watchdog (mirrors TTV-AB's post-ad resume intent): a player Twitch
+        // paused during the break must not outlive it paused, whatever the worker decided at
+        // break end. Bounded — a few attempts per post-break window, 1.5s apart, never against
+        // the user's own pause.
+        if (!playerBufferState.inAdBreak && playerBufferState.adResumeIntent && !playerBufferState.userPauseIntent && playerForMonitoringBuffering) {
+            try {
+                if (hasPendingAdResumeIntent()) {
+                    const rv = playerForMonitoringBuffering.player?.getHTMLVideoElement?.();
+                    if (rv && rv.paused && !rv.ended) {
+                        if ((playerBufferState.adResumeWatchdogAttempts || 0) >= AdResumeWatchdogMaxAttempts) {
+                            if (!playerBufferState.adResumeWatchdogExhaustedLogged) {
+                                playerBufferState.adResumeWatchdogExhaustedLogged = true;
+                                console.log('[AD DEBUG] Post-break resume watchdog: player still paused after ' + AdResumeWatchdogMaxAttempts + ' resume attempts — giving up until the next break or a user action');
+                            }
+                        } else if (resumePlayerAfterAdIfNeeded('after the ad break (watchdog)')) {
+                            playerBufferState.adResumeWatchdogAttempts = (playerBufferState.adResumeWatchdogAttempts || 0) + 1;
+                        }
+                    }
+                }
+            } catch {}
+        }
         // Loading-circle health check: during an ad strip+recovery loop the normal buffer monitor
         // is gated off (isActivelyStrippingAds), so a visibly stalled player would otherwise wait
         // for the worker's poll-based early reload (~10s). This catches the visible stall ~3s after
@@ -2841,7 +3078,15 @@
         // on iOS — re-firing it while the player is already paused just re-creates the black-screen +
         // play-icon under the user's finger ("unable to hit play"). Leave the paused element standing so
         // a single tap resumes it. Opt-out with the rest of the iOS reload workaround: twitchAdSolutions_iosSoftReload=false.
+        // A player Twitch paused during the break with no user interaction (see the pause listener)
+        // is treated like one that was playing: resumed, never left standing as "user intent".
+        const adOwnedPaused = wasPaused && !playerBufferState.userPauseIntent && hasPendingAdResumeIntent();
         if (isReload && iosSoftReload && wasPaused) {
+            if (adOwnedPaused) {
+                console.log('[AD DEBUG] iOS/iPadOS: skipping reload — player paused by Twitch during the ad break; resuming the existing (gesture-blessed) element instead');
+                resumeAdOwnedPause(player.getHTMLVideoElement?.(), 'iOS post-ad resume');
+                return;
+            }
             console.log('[AD DEBUG] iOS/iPadOS: skipping reload — player already paused (anti-churn; tap to resume)');
             return;
         }
@@ -2853,6 +3098,12 @@
                     playerBufferState.loggedPauseIntent = true;
                     console.log('[AD DEBUG] Respecting user pause intent — skipping auto-resume');
                 }
+                return;
+            }
+            if (adOwnedPaused) {
+                // A pause/play nudge is a no-op on a paused element — resume it instead.
+                console.log('[AD DEBUG] Player paused by Twitch during the ad break (no user interaction) — resuming instead of pause/play');
+                resumeAdOwnedPause(player.getHTMLVideoElement?.(), 'post-ad pause/play');
                 return;
             }
             // If WE recently called pause/play and player is still paused, retry play (stuck from autoplay policy or ad-state interference)
@@ -3039,12 +3290,15 @@
             playerState.setSrc({ isNewMediaPlayerInstance: hardReload, refreshAccessToken: refreshToken });
             postTwitchWorkerMessage('TriggeredPlayerReload');
             // Resume playback with retry — only if user hadn't manually paused
-            if (!wasPaused) {
+            if (adOwnedPaused) {
+                console.log('[AD DEBUG] Player was paused by Twitch during the ad break (no user interaction) — resuming after the reload');
+            }
+            if (!wasPaused || adOwnedPaused) {
                 playPlayer(player, 'reload');
                 // Retry resume if play() didn't take effect
                 setTimeout(() => {
                     try {
-                        if (player.isPaused() && !player.core?.paused) {
+                        if (player.isPaused() && !playerBufferState.userPauseIntent && (!player.core?.paused || adOwnedPaused)) {
                             playPlayer(player, 'post-reload resume retry');
                         }
                     } catch {}
@@ -3380,6 +3634,7 @@
     if (AvSyncTrace) {
         hookAvSyncTrace(window, 'main', () => !!playerBufferState.inAdBreak || Date.now() < (playerBufferState.avTraceUntil || 0), () => document.querySelector('video'));
     }
+    initPlaybackControlInteractionMonitor();
     hookWindowWorker();
     hookFetch();
     if (PlayerBufferingFix) {

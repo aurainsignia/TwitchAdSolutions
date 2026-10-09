@@ -96,6 +96,9 @@ Best case — no backup stream switch, no rebuffer gap. The main stream plays un
 |---|---|
 | `Attempt to fix buffering position:X bufferedPosition:Y bufferDuration:Z` | Buffer monitor detected a stall and is attempting pause/play |
 | `Video state: readyState=2 networkState=2 ... paused=true` | Player stalled with insufficient data. May self-recover |
+| `Twitch paused the player during an ad break with no user interaction — ad-owned pause, resuming (chain 1/2)` | Twitch's own ad-transition pause (no click/key within 1.2s). vaft resumes it instead of treating it as a user pause |
+| `Player still paused after the ad break and the pause did not come from the user — resuming` | Break-end / watchdog resume of an ad-owned pause. If the watchdog gives up after 3 attempts, look for a `play() rejected after …` line (browser refused the call) |
+| `Respecting user pause intent — skipping auto-resume` | The pause followed an explicit play/pause interaction; vaft leaves it alone |
 | `Position jumped Xs — starting drift correction` | Player jumped ahead. Drift correction speeds up to catch live edge |
 | `Downgraded reload to pause/play to preserve PiP` | PiP mode active. Using lighter recovery to keep PiP open |
 
