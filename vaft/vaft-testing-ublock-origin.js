@@ -37,7 +37,7 @@ twitch-videoad.js text/javascript
         }
     }
     'use strict';
-    const ourTwitchAdSolutionsVersion = 680;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 681;// Used to prevent conflicts with outdated versions of the scripts
     console.log('[AD DEBUG] TwitchAdSolutions vaft-testing v' + ourTwitchAdSolutionsVersion + ' loading');
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log('[AD DEBUG] CONFLICT: vaft-testing v' + ourTwitchAdSolutionsVersion + ' skipped — another script already active (v' + window.twitchAdSolutionsVersion + '). Remove duplicate scripts.');
@@ -84,6 +84,7 @@ twitch-videoad.js text/javascript
         scope.DisableInAdGapSeek = false;// In-ad frozen-buffer-gap seek (mirrors TTV-AB #33). Default on. Set twitchAdSolutions_disableInAdGapSeek=true to turn it OFF (for A/B isolation of mid-break pause/loading-circle reports).
         scope.DisableInAdFreezeReload = false;// In-ad frozen-playhead reload escalation — readyState-independent backstop for audio-gap CSAI freezes the gap-seek can't catch (observed ~60s stalls). Default on. Set twitchAdSolutions_disableInAdFreezeReload=true to turn it OFF.
         scope.DisablePostBreakWedge = false;// Post-break video-wedge recovery (mirrors GosuDRM/TTV-AB _checkPostBreakWedge, v12.0.0). Detects "audio running, video frozen" after an ad break — playhead advancing while the decoder emits no new frames — via getVideoPlaybackQuality().totalVideoFrames, which the currentTime-based freeze checks can't see. Default on. Set twitchAdSolutions_disablePostBreakWedge=true to turn it OFF.
+        scope.DisableAdOwnedResume = false;// v681 / v68.5.8: a no-interaction pause during a break or the 15s post-break window is Twitch's own ad-transition pause, resumed at break end (watchdog-backed) instead of being read as user intent. Default on. Set twitchAdSolutions_disableAdOwnedResume=true to turn it OFF (every pause is user intent again — the pre-v680 behaviour).
         scope.DisableBackgroundResume = false;// Issue #255: resume a Twitch-initiated pause while the tab is hidden (retry chain, strike-capped so a deliberate media-key pause is respected). Default on. Set twitchAdSolutions_disableBackgroundResume=true to turn it OFF.
         scope.AvSyncTrace = true;// A/V desync diagnostics (testing): [AV TRACE] logs playlist splices, BLANK_MP4 substitutions and per-track SourceBuffer ranges / timestampOffset changes during ad breaks + 30s after. Set twitchAdSolutions_avSyncTrace=false to silence. Call avSyncMark() in the console when you notice desync.
         scope.AvTraceBlankServed = 0;
@@ -493,7 +494,6 @@ twitch-videoad.js text/javascript
                             // now. The worker's ReloadPlayer / PauseResumePlayer (if any) arrived just
                             // before this message; a CSAI-only break sends no player action at all.
                             playerBufferState.adResumeIntentUntil = Date.now() + AdResumeIntentWindowMs;
-                            playerBufferState.adOwnedResumeChains = 0;
                             playerBufferState.adOwnedPauseLogged = false;
                             playerBufferState.adResumeWatchdogAttempts = 0;
                             playerBufferState.adResumeWatchdogExhaustedLogged = false;
@@ -2157,14 +2157,12 @@ twitch-videoad.js text/javascript
         numSame: 0,
         fixAttempts: 0,
         lastFixTime: 0,
-        // Ad-owned pause handling — see initPlaybackControlInteractionMonitor / scheduleAdOwnedResume
+        // Ad-owned pause handling — see initPlaybackControlInteractionMonitor / resumeAdOwnedPause
         userPausedAt: 0,
         userPausedHadExplicitInteraction: false,
         lastPlaybackControlInteractionAt: 0,
         adResumeIntent: false,// playback should come back after the current / just-ended break
         adResumeIntentUntil: 0,
-        adOwnedResumeChains: 0,
-        adOwnedResumeTimers: [],
         adOwnedPauseLogged: false,
         adResumeWatchdogAttempts: 0,
         adResumeWatchdogExhaustedLogged: false,
@@ -2231,15 +2229,16 @@ twitch-videoad.js text/javascript
     // A pause is the user's only when it follows an explicit playback interaction within the
     // last 1200ms: the player's play/pause control, a click on the video surface, Space/K, or a
     // media key (Twitch registers those through navigator.mediaSession). A no-interaction pause
-    // during a break, or in the 15s post-break window, is ad-owned: resumed with a short retry
-    // chain (strike-capped so vaft never fights Twitch indefinitely), and resumed again at break
-    // end if it is still paused. The resume intent is armed on the ad-start edge and dropped the
-    // moment the user pauses explicitly, so a deliberate mid-break pause stays paused.
+    // during a break, or in the 15s post-break window, is ad-owned: not user intent, and not
+    // fought where it happens — it is resumed at the ad-end edge and, if that does not take, by
+    // the post-break watchdog in monitorPlayerBuffering (TTV-AB parity; v680 answered each such
+    // pause with an immediate play() plus a retry chain, and when Twitch's ad hold re-paused the
+    // element every attempt replayed the same sub-second of content). The resume intent is armed
+    // on the ad-start edge and dropped the moment the user pauses explicitly, so a deliberate
+    // mid-break pause stays paused. Opt-out: twitchAdSolutions_disableAdOwnedResume=true.
     const PlaybackControlInteractionWindowMs = 1200;
     const AdTransientPauseClearWindowMs = 1750;// a no-interaction pause this close before ad detection is the ad's early transition pause
     const AdResumeIntentWindowMs = 15000;// post-break window during which a still-paused player is resumed
-    const AdOwnedResumeRetryDelaysMs = [150, 600, 1800, 4000];
-    const AdOwnedResumeMaxChains = 2;// per break, and again per post-break window
     const AdResumeWatchdogMaxAttempts = 3;// buffer-monitor retries per post-break window
     const PlayerControlInteractionSelector = '[data-a-target="player-play-pause-button"], [data-a-target="player-overlay-play-button"], [data-a-target="player-overlay-click-handler"], [data-a-target="video-player"], video';
     function isEditableInteractionTarget(target) {
@@ -2316,11 +2315,14 @@ twitch-videoad.js text/javascript
         playerBufferState.userPausedHadExplicitInteraction = explicit;
         if (explicit) {
             playerBufferState.adResumeIntent = false;// the user does not want playback back after the break
-            clearAdOwnedResumeTimers();
             clearBackgroundResumeTimers();
         }
     }
     function armAdResumeIntent(video) {
+        if (DisableAdOwnedResume) {
+            playerBufferState.adResumeIntent = false;
+            return;
+        }
         // A no-interaction pause just before the ad was detected is the ad's early transition
         // pause, not the user's — clear it first (TTV-AB _AD_TRANSIENT_PAUSE_CLEAR_WINDOW_MS).
         if (playerBufferState.userPauseIntent && !playerBufferState.userPausedHadExplicitInteraction
@@ -2329,7 +2331,6 @@ twitch-videoad.js text/javascript
             playerBufferState.userPauseIntent = false;
             playerBufferState.loggedPauseIntent = false;
         }
-        playerBufferState.adOwnedResumeChains = 0;
         playerBufferState.adOwnedPauseLogged = false;
         playerBufferState.adResumeIntent = !playerBufferState.userPauseIntent && !(video && video.ended);
         playerBufferState.adResumeIntentUntil = Date.now() + AdResumeIntentWindowMs;
@@ -2344,36 +2345,38 @@ twitch-videoad.js text/javascript
     function isAdOwnedPauseContext() {
         return !!playerBufferState.inAdBreak || hasPendingAdResumeIntent();
     }
-    function clearAdOwnedResumeTimers() {
-        for (const t of (playerBufferState.adOwnedResumeTimers || [])) clearTimeout(t);
-        playerBufferState.adOwnedResumeTimers = [];
-    }
-    // play() through Twitch's wrapper first so its React state follows; fall back to the element
-    // when the wrapper thinks it is already playing — a paused element under a "playing" UI is
-    // exactly the state the manual pause/unpause workaround was resetting.
+    // Resume through Twitch's wrapper so its React state follows. When the wrapper's play() is a
+    // no-op — its state already says "playing" while the element sits paused, the state the manual
+    // pause/unpause workaround resets — do that same pause/play through the wrapper. Never play the
+    // element behind the wrapper's back: the v680 element fallback left Twitch's state disagreeing
+    // with the element, and a retry chain repeated it.
     function resumeAdOwnedPause(video, context) {
-        if (playerBufferState.userPauseIntent) return;
+        if (playerBufferState.userPauseIntent) return false;
         const player = getPlayerAndState()?.player;
         const current = player?.getHTMLVideoElement?.() || video;
-        if (!current || !current.isConnected || current.ended || !current.paused) return;
-        if (player && typeof player.play === 'function') playPlayer(player, context);
-        if (current.paused) playPlayer(current, context + ' (element)');
-    }
-    function scheduleAdOwnedResume(video, context) {
-        if ((playerBufferState.adOwnedResumeChains || 0) >= AdOwnedResumeMaxChains) {
-            if (!playerBufferState.adOwnedPauseLogged) {
-                playerBufferState.adOwnedPauseLogged = true;
-                console.log('[AD DEBUG] Twitch keeps pausing the player ' + context + ' (' + AdOwnedResumeMaxChains + ' resume chains) — leaving it paused until the break ends, then resuming');
+        if (!current || !current.isConnected || current.ended || !current.paused) return false;
+        playerBufferState.lastAdResumeAt = Date.now();
+        if (player && typeof player.play === 'function') {
+            playPlayer(player, context);
+            if (current.paused && typeof player.pause === 'function') {
+                playerBufferState.weJustPaused = Date.now();// our own pause — the pause listener ignores it
+                player.pause();
+                playPlayer(player, context + ' (pause/play)');
             }
-            return;
+            return true;
         }
-        playerBufferState.adOwnedResumeChains = (playerBufferState.adOwnedResumeChains || 0) + 1;
-        clearAdOwnedResumeTimers();
-        console.log('[AD DEBUG] Twitch paused the player ' + context + ' with no user interaction — ad-owned pause, resuming (chain ' + playerBufferState.adOwnedResumeChains + '/' + AdOwnedResumeMaxChains + ')');
-        resumeAdOwnedPause(video, 'ad-owned pause');
-        for (const delay of AdOwnedResumeRetryDelaysMs) {
-            playerBufferState.adOwnedResumeTimers.push(setTimeout(() => resumeAdOwnedPause(video, 'ad-owned pause retry'), delay));
-        }
+        playPlayer(current, context + ' (element)');
+        return true;
+    }
+    // A no-interaction pause during a break or the post-break window is Twitch's own ad-transition
+    // pause. It is NOT fought where it happens (TTV-AB parity): v680 answered every such pause with
+    // an immediate play() and a four-step retry chain, and when Twitch's ad hold re-paused the
+    // element each attempt replayed the same sub-second of content. The resume happens at the
+    // ad-end edge and, if that does not take, from the post-break watchdog in monitorPlayerBuffering.
+    function noteAdOwnedPause(context) {
+        if (playerBufferState.adOwnedPauseLogged) return;
+        playerBufferState.adOwnedPauseLogged = true;
+        console.log('[AD DEBUG] Twitch paused the player ' + context + ' with no user interaction — ad-owned pause, not user intent; ' + (playerBufferState.inAdBreak ? 'leaving it until the break ends, then resuming' : 'the post-break watchdog will resume it'));
     }
     // Break-end resume: whatever the worker decided (reload, pause/play, or — on a CSAI-only
     // break — no player action at all), a player Twitch paused during the break must not stay
@@ -2387,10 +2390,8 @@ twitch-videoad.js text/javascript
         const now = Date.now();
         if (playerBufferState.lastReloadAt && (now - playerBufferState.lastReloadAt) < 3000) return false;
         if (playerBufferState.lastAdResumeAt && (now - playerBufferState.lastAdResumeAt) < 1500) return false;
-        playerBufferState.lastAdResumeAt = now;
         console.log('[AD DEBUG] Player still paused ' + context + ' and the pause did not come from the user — resuming');
-        resumeAdOwnedPause(video, 'post-ad resume');
-        return true;
+        return resumeAdOwnedPause(video, 'post-ad resume');
     }
     // Poll the player state to detect and fix buffering caused by ad stream switching
     function monitorPlayerBuffering() {
@@ -2423,11 +2424,14 @@ twitch-videoad.js text/javascript
                             recordUserPause(true);
                             return;
                         }
-                        if (isAdOwnedPauseContext()) {
+                        if (!DisableAdOwnedResume && isAdOwnedPauseContext()) {
                             // No interaction, during a break or the post-break window: Twitch's own
-                            // ad-transition pause. Nothing in Twitch resumes it once the ad it was
-                            // waiting on is blocked — resume it (bounded), and again at break end.
-                            scheduleAdOwnedResume(video, playerBufferState.inAdBreak ? 'during an ad break' : 'right after an ad break');
+                            // ad-transition pause, not user intent. Not fought here (see
+                            // noteAdOwnedPause) — resumed at the ad-end edge / by the post-break
+                            // watchdog. A hidden tab takes the background resume chain (issue #255),
+                            // as TTV-AB resumes unfocused playback mid-break.
+                            noteAdOwnedPause(playerBufferState.inAdBreak ? 'during an ad break' : 'right after an ad break');
+                            if (document.hidden && !DisableBackgroundResume) scheduleBackgroundResume(video);
                             return;
                         }
                         if (document.hidden && !DisableBackgroundResume) {
@@ -2468,7 +2472,6 @@ twitch-videoad.js text/javascript
                               playerBufferState.userPauseIntent = false;
                         playerBufferState.loggedPauseIntent = false;
                               playerBufferState.adResumeIntent = false;
-                              clearAdOwnedResumeTimers();
                           }
                       }
                     }
@@ -3582,6 +3585,11 @@ twitch-videoad.js text/javascript
         if (lsDisableBackgroundResume === 'true') {
             DisableBackgroundResume = true;
             console.log('[AD DEBUG] Background resume DISABLED via localStorage — a hidden-tab pause during ads stays paused until tab focus (A/B isolation)');
+        }
+        const lsDisableAdOwnedResume = localStorage.getItem('twitchAdSolutions_disableAdOwnedResume');
+        if (lsDisableAdOwnedResume === 'true') {
+            DisableAdOwnedResume = true;
+            console.log('[AD DEBUG] Ad-owned pause handling DISABLED via localStorage — every pause is treated as user intent again; a player Twitch pauses during a break stays paused until you toggle it (A/B isolation)');
         }
         const lsAvSyncTrace = localStorage.getItem('twitchAdSolutions_avSyncTrace');
         if (lsAvSyncTrace === 'false') {
